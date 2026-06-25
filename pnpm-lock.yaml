@@ -17,6 +17,9 @@ importers:
       '@babylonjs/core':
         specifier: ^7.54.0
         version: 7.54.3
+      colyseus.js:
+        specifier: ^0.15.28
+        version: 0.15.28
       react:
         specifier: ^19.0.0
         version: 19.2.7
@@ -870,6 +873,10 @@ packages:
     resolution: {integrity: sha512-rwHwUfXL40Chm1r08yrhU3qpUvdVlgkKNeyeGPOxnW8/SyVDvgRaed/Uz54AqWNaTCAThlj6QAs3TZcKI0xDEw==}
     engines: {node: '>=0.10.0'}
 
+  colyseus.js@0.15.28:
+    resolution: {integrity: sha512-fJx/EcK4fQsugNviXpTD78bVXySutLprViAWy5qMuyhcU0MfeUuHfrlvUqI18dQUStGckvLggTC7EexmIyI+3g==}
+    engines: {node: '>= 12.x'}
+
   colyseus@0.15.57:
     resolution: {integrity: sha512-h9hkmXOvcreRhJxdu73BJctGEPYW36ImHByjiMhEOIuSQLcNSlkcwaqCll/7Oc/cTELHStTa5eyOnI640mOe8A==}
     engines: {node: '>= 14.x'}
@@ -1077,6 +1084,10 @@ packages:
   http-errors@2.0.1:
     resolution: {integrity: sha512-4FbRdAX+bSdmo4AUFuS0WNiPz8NgFt+r8ThgNWmlrjQjt1Q7ZR9+zTlce2859x4KSXrwIsaeTqDoKQmtP8pLmQ==}
     engines: {node: '>= 0.8'}
+
+  httpie@2.0.0-next.13:
+    resolution: {integrity: sha512-KbKOnq8wt0hVEfteYCSnEsPgzaWxcVc4qZ4OaDU9mVOYLRo3XChjWs3MiuRgFu5y+4JDo7sDKdKzkAn1ljQYFA==}
+    engines: {node: '>=10'}
 
   iconv-lite@0.4.24:
     resolution: {integrity: sha512-v3MXnZAcvnywkTUEZomIActle7RXXeedOR31wwl7VlyoXO4Qi9arvSenNQWne1TcRwhCL1HwLI21bEqdpj8/rA==}
@@ -1373,6 +1384,9 @@ packages:
   toidentifier@1.0.1:
     resolution: {integrity: sha512-o5sSPKEkg/DIQNmH43V0/uerLrpzVedkUh8tGNvaeXpfpuwjKenlSox/2O/BTlZUtEe+JG7s5YhEz608PlAHRA==}
     engines: {node: '>=0.6'}
+
+  tslib@2.8.1:
+    resolution: {integrity: sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==}
 
   tsx@4.22.4:
     resolution: {integrity: sha512-X8EX+XV4QR5xCsrgxaED954zTDfY8KqlDtskKEL0cHhyS/P8b4IFOvGDQpsC9Q1XnLq915wEfwwY/zzskCtmhg==}
@@ -2155,6 +2169,16 @@ snapshots:
 
   cluster-key-slot@1.1.1: {}
 
+  colyseus.js@0.15.28:
+    dependencies:
+      '@colyseus/schema': 2.0.37
+      httpie: 2.0.0-next.13
+      tslib: 2.8.1
+      ws: 8.21.0
+    transitivePeerDependencies:
+      - bufferutil
+      - utf-8-validate
+
   colyseus@0.15.57(@colyseus/schema@2.0.37)(express@4.22.2):
     dependencies:
       '@colyseus/auth': 0.15.12(@colyseus/core@0.15.57(@colyseus/schema@2.0.37))(express@4.22.2)
@@ -2449,6 +2473,8 @@ snapshots:
       setprototypeof: 1.2.0
       statuses: 2.0.2
       toidentifier: 1.0.1
+
+  httpie@2.0.0-next.13: {}
 
   iconv-lite@0.4.24:
     dependencies:
@@ -2777,6 +2803,8 @@ snapshots:
       picomatch: 4.0.4
 
   toidentifier@1.0.1: {}
+
+  tslib@2.8.1: {}
 
   tsx@4.22.4:
     dependencies:

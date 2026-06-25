@@ -1,16 +1,20 @@
 import { useEffect, useRef } from "react";
-import { createArena } from "./game/scene";
+import { createWorld } from "./game/world";
 import { useHud } from "./store";
 
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const setFps = useHud((s) => s.setFps);
+  const { setFps, setPlayers, setStatus } = useHud.getState();
 
   useEffect(() => {
     if (!canvasRef.current) return;
-    const dispose = createArena(canvasRef.current, setFps);
+    const dispose = createWorld(canvasRef.current, {
+      onFps: setFps,
+      onPlayers: setPlayers,
+      onStatus: setStatus,
+    });
     return dispose;
-  }, [setFps]);
+  }, [setFps, setPlayers, setStatus]);
 
   return (
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
@@ -24,6 +28,7 @@ function Hud() {
   const fps = useHud((s) => s.fps);
   const players = useHud((s) => s.players);
   const arena = useHud((s) => s.arena);
+  const status = useHud((s) => s.status);
 
   const panel: React.CSSProperties = {
     position: "absolute",
@@ -45,10 +50,11 @@ function Hud() {
       </div>
       <div style={{ ...panel, top: 16, right: 16, textAlign: "right" }}>
         <div>FPS {fps}</div>
-        <div>PLAYERS {players}/8</div>
+        <div>PLAYERS {players}</div>
       </div>
       <div style={{ ...panel, bottom: 16, left: 16, fontSize: 12, opacity: 0.85 }}>
-        web-only · Babylon.js · server-authoritative (client carries no authority)
+        <div>WASD / arrows to move · {status}</div>
+        <div style={{ opacity: 0.7 }}>server-authoritative · client predicts &amp; interpolates only</div>
       </div>
     </>
   );
