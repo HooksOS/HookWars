@@ -1,0 +1,25 @@
+{
+  "//": "HookWars Slither config. Deploy gate (CLAUDE.md §2) fails on unsuppressed high/medium findings.",
+  "detectors_to_run": "all",
+  "filter_paths": "lib/|test/|script/",
+  "exclude_dependencies": true,
+  "exclude_informational": false,
+  "exclude_optimization": false,
+  "exclude_low": false,
+  "exclude_medium": false,
+  "exclude_high": false,
+  "fail_on": "medium",
+  "fail_high": true,
+  "fail_medium": true,
+  "fail_low": false,
+  "fail_pedantic": false,
+  "compile_force_framework": "foundry",
+  "solc_remaps": [
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "solady/=lib/solady/src/",
+    "v4-core/=lib/v4-core/src/",
+    "v4-periphery/=lib/v4-periphery/src/",
+    "forge-std/=lib/forge-std/src/",
+    "permit2/=lib/permit2/src/"
+  ]
+}

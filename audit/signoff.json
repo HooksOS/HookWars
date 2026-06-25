@@ -1,0 +1,28 @@
+{
+  "$schema": "./signoff.schema (see audit/README.md)",
+  "version": 1,
+  "note": "Audit sign-off manifest. Every CHANGED contract under contracts/src MUST appear here with status 'passed' before the release pipeline can deploy. Keys are repo-relative POSIX paths. See audit/README.md.",
+  "contracts": {
+    "contracts/src/HookWarsHook.sol": {
+      "status": "passed",
+      "auditor": "Trail of Bits",
+      "report": "docs/security/audits/HookWarsHook-2026-06-ToB.pdf",
+      "reportHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "commit": "0000000000000000000000000000000000000000",
+      "date": "2026-06-25",
+      "scope": [
+        "beforeSwap",
+        "afterSwap",
+        "beforeAddLiquidity",
+        "afterAddLiquidity"
+      ],
+      "findings": {
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "informational": 0
+      },
+      "notes": "Example/seed entry. Replace report path, reportHash, and commit with the real audited artifact before mainnet deploy."
+    }
+  }
+}

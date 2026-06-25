@@ -1,0 +1,318 @@
+# =============================================================================
+# HookWars — Unified Release Pipeline (CLAUDE.md §2 Deploy Gate + §3 In-Sync Release)
+# -----------------------------------------------------------------------------
+# STRUCTURAL GUARANTEE: contracts CANNOT deploy unless ALL FOUR gate jobs pass:
+#   slither · forge-fork · unit-int · audit-signoff
+#
+# This is enforced THREE independent ways (see tools/ci/README.md):
+#   1. Branch protection requires these four jobs as status checks.
+#   2. The `needs:` DAG below — deploy-contracts needs every gate job; GitHub
+#      will not schedule it if any gate job fails or is skipped.
+#   3. `deploy-contracts` runs in the protected `production` environment, which
+#      holds the ONLY copy of the Base deployer key + required reviewers.
+#
+# In-sync release (§3): one build → one signed image set → one GitOps commit →
+# ArgoCD rolls the whole fleet to the SAME version atomically. Gate red ⇒ the
+# ENTIRE release is blocked, not just contracts.
+#
+# NOTE ON ACTION PINNING: actions are pinned to @vX tags for readability. For
+# production you MUST repin every `uses:` to a full commit SHA (supply-chain
+# hardening), e.g. `crytic/slither-action@<40-char-sha> # v0.4.0`.
+# =============================================================================
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      deploy_contracts:
+        description: "Deploy contracts to Base (still requires the full gate to pass)"
+        type: boolean
+        default: false
+
+# Only one release per ref runs at a time; never cancel an in-flight release
+# (cancelling mid-deploy could desync the fleet — §3 atomicity).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write # cosign keyless / OIDC to cloud + GHCR
+
+env:
+  NODE_VERSION: "20"
+  PNPM_VERSION: "10.33.0"
+  FOUNDRY_PROFILE: ci
+  REGISTRY: ghcr.io
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # GATE JOB 1/4 — Slither static analysis (must be clean: no high/medium).
+  # ---------------------------------------------------------------------------
+  slither:
+    name: "Gate · Slither static analysis"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # pin to SHA in prod
+        with:
+          submodules: recursive
+
+      - name: Run Slither on contracts/
+        uses: crytic/slither-action@v0.4.0 # pin to SHA in prod
+        with:
+          target: contracts/
+          slither-config: contracts/slither.config.json
+          fail-on: medium # any high/medium finding fails the gate
+
+  # ---------------------------------------------------------------------------
+  # GATE JOB 2/4 — Foundry fork tests against Base (forge test --fork-url ...).
+  # ---------------------------------------------------------------------------
+  forge-fork:
+    name: "Gate · Foundry fork tests (Base)"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    env:
+      BASE_RPC: ${{ secrets.BASE_RPC_URL }}
+    steps:
+      - uses: actions/checkout@v4 # pin to SHA in prod
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1 # pin to SHA in prod
+        with:
+          version: stable
+
+      - name: Forge build
+        run: forge build --sizes
+
+      - name: Forge fork tests against Base
+        run: |
+          if [ -z "${BASE_RPC}" ]; then
+            echo "::error::BASE_RPC_URL secret is not set — cannot run fork tests. Gate fails."
+            exit 1
+          fi
+          forge test --fork-url "${BASE_RPC}" -vvv
+
+  # ---------------------------------------------------------------------------
+  # GATE JOB 3/4 — Full unit + integration suite (contracts + JS workspaces).
+  # ---------------------------------------------------------------------------
+  unit-int:
+    name: "Gate · Unit + integration tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # pin to SHA in prod
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1 # pin to SHA in prod
+        with:
+          version: stable
+
+      - name: Forge unit tests
+        working-directory: contracts
+        run: forge test -vvv
+
+      - uses: pnpm/action-setup@v4 # pin to SHA in prod
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4 # pin to SHA in prod
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install workspace deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build (apps/ + services/ + packages/)
+        run: pnpm build
+
+      - name: Unit + integration tests (turbo)
+        run: pnpm test
+
+  # ---------------------------------------------------------------------------
+  # GATE JOB 4/4 — Audit sign-off (CLAUDE.md §1: never deploy unaudited code).
+  # ---------------------------------------------------------------------------
+  audit-signoff:
+    name: "Gate · Audit sign-off"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # pin to SHA in prod
+        with:
+          fetch-depth: 0 # full history so git diff can resolve the base ref
+
+      - uses: actions/setup-node@v4 # pin to SHA in prod
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Verify every changed contract is audited & passed
+        env:
+          BASE_REF: origin/${{ github.event.repository.default_branch }}
+        run: node tools/ci/verify-audit-signoff.mjs
+
+  # ---------------------------------------------------------------------------
+  # BUILD — one coherent, version-locked image set for the WHOLE fleet (§3).
+  # Needs ALL FOUR gate jobs: no images are built on a red gate.
+  # ---------------------------------------------------------------------------
+  build-images:
+    name: "Build · Fleet images (cosign-signed)"
+    needs: [slither, forge-fork, unit-int, audit-signoff]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    strategy:
+      matrix:
+        # One atomic release = every service/app/doc surface, same version (§3).
+        component:
+          - services/game-backend
+          - services/matchmaking
+          - services/realtime
+          - services/workers
+          - services/bot-discord
+          - services/bot-telegram
+          - services/ai-marketing
+          - apps/web-marketing
+          - apps/web-dashboard
+          - apps/web-marketplace
+          - apps/web-governance
+          - apps/game-client
+          - docs
+    steps:
+      - uses: actions/checkout@v4 # pin to SHA in prod
+
+      - name: Compute release version
+        id: meta
+        run: echo "version=${GITHUB_REF_NAME//\//-}-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3 # pin to SHA in prod
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3 # pin to SHA in prod
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3 # pin to SHA in prod
+
+      - name: Build & push ${{ matrix.component }}
+        id: build
+        uses: docker/build-push-action@v6 # pin to SHA in prod
+        with:
+          context: .
+          file: ${{ matrix.component }}/Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.component }}:${{ steps.meta.outputs.version }}
+
+      - name: Sign image (keyless / OIDC)
+        run: cosign sign --yes "${REGISTRY}/${{ github.repository }}/${{ matrix.component }}@${{ steps.build.outputs.digest }}"
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+
+  # ---------------------------------------------------------------------------
+  # DEPLOY CONTRACTS — the gated step. Needs the gate AND the build.
+  # Runs in the PROTECTED `production` environment (required reviewers +
+  # the ONLY Base deployer key). This is the structural lock: even if someone
+  # rewired `needs:`, the deployer secret lives nowhere else.
+  # ---------------------------------------------------------------------------
+  deploy-contracts:
+    name: "Deploy · Contracts to Base (gated)"
+    needs: [slither, forge-fork, unit-int, audit-signoff, build-images]
+    runs-on: ubuntu-latest
+    environment: production # protected: required reviewers + scoped secrets
+    steps:
+      - uses: actions/checkout@v4 # pin to SHA in prod
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1 # pin to SHA in prod
+        with:
+          version: stable
+
+      - name: Re-assert audit sign-off at the door (defence in depth)
+        env:
+          BASE_REF: origin/${{ github.event.repository.default_branch }}
+        run: node tools/ci/verify-audit-signoff.mjs
+
+      - name: Deploy to Base
+        working-directory: contracts
+        env:
+          BASE_RPC: ${{ secrets.BASE_RPC_URL }}
+          DEPLOYER_PRIVATE_KEY: ${{ secrets.BASE_DEPLOYER_PRIVATE_KEY }}
+          ETHERSCAN_API_KEY: ${{ secrets.BASESCAN_API_KEY }}
+        run: |
+          forge script script/Deploy.s.sol:Deploy \
+            --rpc-url "${BASE_RPC}" \
+            --broadcast \
+            --verify \
+            -vvv
+
+      - name: Publish deployment addresses (for fleet wiring)
+        uses: actions/upload-artifact@v4 # pin to SHA in prod
+        with:
+          name: contract-addresses-${{ needs.build-images.outputs.version }}
+          path: contracts/broadcast/**/run-latest.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # RELEASE FLEET — GitOps version bump. One commit to infra-gitops pins the
+  # whole fleet (services, apps, docs, contract addresses) to the SAME version;
+  # ArgoCD applies the Helm umbrella chart in one atomic sync wave (§3).
+  # ---------------------------------------------------------------------------
+  release-fleet:
+    name: "Release · GitOps fleet bump (atomic)"
+    needs: [build-images, deploy-contracts]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout infra-gitops
+        uses: actions/checkout@v4 # pin to SHA in prod
+        with:
+          repository: ${{ github.repository_owner }}/infra-gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: infra-gitops
+
+      - name: Download contract addresses
+        uses: actions/download-artifact@v4 # pin to SHA in prod
+        with:
+          name: contract-addresses-${{ needs.build-images.outputs.version }}
+          path: addresses
+
+      - name: Bump umbrella chart to release version
+        working-directory: infra-gitops
+        env:
+          VERSION: ${{ needs.build-images.outputs.version }}
+        run: |
+          # Pin every component image tag + contract addresses to ONE version.
+          # ArgoCD watches this repo and rolls the whole fleet atomically.
+          if [ ! -f values.release.yaml ]; then
+            echo "::error::infra-gitops/values.release.yaml missing — cannot bump fleet."
+            exit 1
+          fi
+          sed -i "s/^  version:.*/  version: ${VERSION}/" values.release.yaml
+          cp -r ../addresses/* ./contract-addresses/ 2>/dev/null || true
+
+      - name: Commit & push GitOps bump (triggers ArgoCD sync)
+        working-directory: infra-gitops
+        env:
+          VERSION: ${{ needs.build-images.outputs.version }}
+        run: |
+          git config user.name "hookwars-release-bot"
+          git config user.email "release-bot@hookwars.dev"
+          git add -A
+          git commit -m "release: fleet → ${VERSION} (atomic in-sync rollout)" || {
+            echo "Nothing to commit — fleet already at ${VERSION}"; exit 0;
+          }
+          git push origin HEAD

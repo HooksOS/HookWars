@@ -1,0 +1,56 @@
+# HookWars — Foundry workspace
+# Base (chain 8453) + Uniswap v4 hooks. Deploy is gated by Slither + fork tests + audit (CLAUDE.md §2).
+
+[profile.default]
+src = "src"
+out = "out"
+test = "test"
+script = "script"
+libs = ["lib"]
+# Uniswap v4 uses transient storage (TSTORE/TLOAD) -> Cancun. solc 0.8.26 has native Cancun support.
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 1_000
+# v4-core/v4-periphery hit "stack too deep" without the IR pipeline.
+via_ir = true
+bytecode_hash = "none"
+cbor_metadata = false
+ffi = false
+# Tests only need read access to the workspace root (e.g. broadcast artifacts); no write/exec.
+fs_permissions = [{ access = "read", path = "./" }]
+gas_reports = ["HookWarsHook", "Treasury"]
+
+# CI profile: heavier optimization + far more fuzz runs so the deploy gate is meaningful.
+[profile.ci]
+optimizer_runs = 10_000
+verbosity = 4
+fuzz = { runs = 50_000, max_test_rejects = 1_000_000 }
+invariant = { runs = 1_000, depth = 256, fail_on_revert = true }
+
+[fuzz]
+runs = 1_000
+max_test_rejects = 65_536
+seed = "0x1"
+
+[invariant]
+runs = 256
+depth = 128
+fail_on_revert = false
+call_override = false
+
+# Remappings are kept in remappings.txt (single source of truth) and auto-loaded by forge.
+
+[rpc_endpoints]
+base = "${BASE_RPC}"
+
+[etherscan]
+base = { key = "${BASESCAN_API_KEY}", chain = 8453 }
+
+[fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = false
+int_types = "long"
+quote_style = "double"
+number_underscore = "thousands"

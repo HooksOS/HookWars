@@ -1,0 +1,14 @@
+# Foundry
+out/
+cache/
+broadcast/
+# Dependencies are vendored via `forge install` (git submodules under lib/)
+# Keep lib/ out of this app's source tree noise; it is managed by forge.
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Misc
+*.log

@@ -1,0 +1,136 @@
+# =============================================================================
+# HookWars — PR CI (the required status checks for the Deploy Gate, CLAUDE.md §2)
+# -----------------------------------------------------------------------------
+# Runs the SAME four gate jobs as release.yml on every PR to main, so that the
+# job names below EXIST as branch-protection "required status checks". A PR
+# cannot merge to main unless all four are green — which is what makes the gate
+# structurally enforceable (see tools/ci/README.md).
+#
+# Job names here MUST stay in sync with the required-check names an admin
+# configures in branch protection:
+#   slither · forge-fork · unit-int · audit-signoff · lint
+#
+# Action pinning: @vX tags for readability; repin to full commit SHAs in prod.
+# =============================================================================
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  merge_group: {} # so the same checks run in the merge queue
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20"
+  PNPM_VERSION: "10.33.0"
+  FOUNDRY_PROFILE: ci
+
+jobs:
+  # ----- GATE 1/4 — Slither --------------------------------------------------
+  slither:
+    name: slither
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # pin to SHA in prod
+        with:
+          submodules: recursive
+      - name: Slither static analysis
+        uses: crytic/slither-action@v0.4.0 # pin to SHA in prod
+        with:
+          target: contracts/
+          slither-config: contracts/slither.config.json
+          fail-on: medium
+
+  # ----- GATE 2/4 — Foundry fork tests --------------------------------------
+  forge-fork:
+    name: forge-fork
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    env:
+      BASE_RPC: ${{ secrets.BASE_RPC_URL }}
+    steps:
+      - uses: actions/checkout@v4 # pin to SHA in prod
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1 # pin to SHA in prod
+        with:
+          version: stable
+      - name: Forge build
+        run: forge build --sizes
+      - name: Forge fork tests against Base
+        run: |
+          if [ -z "${BASE_RPC}" ]; then
+            echo "::error::BASE_RPC_URL secret is not set — fork tests cannot run. Gate fails."
+            exit 1
+          fi
+          forge test --fork-url "${BASE_RPC}" -vvv
+
+  # ----- GATE 3/4 — Unit + integration --------------------------------------
+  unit-int:
+    name: unit-int
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # pin to SHA in prod
+      - uses: foundry-rs/foundry-toolchain@v1 # pin to SHA in prod
+        with:
+          version: stable
+      - name: Forge unit tests
+        working-directory: contracts
+        run: forge test -vvv
+      - uses: pnpm/action-setup@v4 # pin to SHA in prod
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4 # pin to SHA in prod
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        run: pnpm build
+      - name: Unit + integration tests
+        run: pnpm test
+
+  # ----- GATE 4/4 — Audit sign-off ------------------------------------------
+  audit-signoff:
+    name: audit-signoff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # pin to SHA in prod
+        with:
+          fetch-depth: 0 # full history so the verifier can diff against the base
+      - uses: actions/setup-node@v4 # pin to SHA in prod
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Verify changed contracts are audited & passed
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+        run: node tools/ci/verify-audit-signoff.mjs
+
+  # ----- Lint (solhint + JS lint) -------------------------------------------
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # pin to SHA in prod
+      - uses: pnpm/action-setup@v4 # pin to SHA in prod
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4 # pin to SHA in prod
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+      - name: Lint workspaces
+        run: pnpm -r --if-present lint
+      - name: Solhint (contracts)
+        run: pnpm --filter ./contracts --if-present lint:sol || npx --yes solhint "contracts/src/**/*.sol"
