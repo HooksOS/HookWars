@@ -23,12 +23,21 @@ const MAX_DT = 0.1; // never trust a client dt larger than this (anti-speedhack)
 const MAX_INPUTS_PER_TICK = 4; // drop floods (rate-limit / anti-cheat)
 
 // --- combat tuning (all server-authoritative) ---
-const FIRE_COOLDOWN_TICKS = 8; // ~250 ms between shots at 30 Hz (rate-limit)
+// Timing uses wall-clock (Date.now) not tick counts, so cooldown/respawn/round
+// length stay accurate even if the sim loop runs below its nominal rate.
+const FIRE_COOLDOWN_MS = 250; // min interval between shots (rate-limit)
 const FIRE_RANGE = 22; // hitscan max distance (world units)
 const FIRE_DAMAGE = 34; // 3 shots to down a 100 HP player
 const PLAYER_RADIUS = 0.7; // hit cylinder radius (matches character footprint)
 const MAX_HP = 100;
-const RESPAWN_TICKS = TICK_HZ * 3; // 3 s respawn delay
+const RESPAWN_MS = 3000; // 3 s respawn delay
+
+// --- match flow (server-authoritative; tunable via env for tests/ops) ---
+const ROUND_SECONDS = Number(process.env.ROUND_SECONDS ?? 180); // round length
+const SCORE_TO_WIN = Number(process.env.SCORE_TO_WIN ?? 10); // first to N kills ends early
+const POSTROUND_MS = Number(process.env.POSTROUND_SECONDS ?? 6) * 1000; // scoreboard hold
+const PHASE_ACTIVE = 1;
+const PHASE_ENDED = 2;
 
 /**
  * Server-authoritative Arena Deathmatch room.
@@ -43,13 +52,19 @@ export class ArenaRoom extends Room<ArenaState> {
 
   /** queued inputs per client session id, drained each simulation tick */
   private queues = new Map<string, InputMessage[]>();
-  /** tick of each player's last shot — enforces the server-side fire cooldown */
-  private lastFireTick = new Map<string, number>();
-  /** tick at which a downed player respawns */
-  private respawnAt = new Map<string, number>();
+  /** wall-clock ms of each player's last shot — enforces the fire cooldown */
+  private lastFireMs = new Map<string, number>();
+  /** wall-clock ms at which a downed player respawns */
+  private respawnAtMs = new Map<string, number>();
+  /** wall-clock ms the current round started (for the countdown) */
+  private roundStartMs = 0;
+  /** wall-clock ms the post-round scoreboard hold ends and the next round begins */
+  private postRoundEndMs = 0;
 
   onCreate(): void {
     this.setState(new ArenaState());
+    this.state.scoreToWin = SCORE_TO_WIN;
+    this.startRound();
     this.setSimulationInterval((deltaMs) => this.update(deltaMs), TICK_MS);
 
     this.onMessage("input", (client, message: InputMessage) => {
@@ -70,7 +85,7 @@ export class ArenaRoom extends Room<ArenaState> {
     const player = new Player();
     player.id = client.sessionId;
     player.faction = count % 4;
-    this.placeAtSpawn(player, count);
+    this.placeAtSpawn(player, this.freeSpawnSlot());
     this.state.players.set(client.sessionId, player);
     this.queues.set(client.sessionId, []);
   }
@@ -78,8 +93,8 @@ export class ArenaRoom extends Room<ArenaState> {
   onLeave(client: Client): void {
     this.state.players.delete(client.sessionId);
     this.queues.delete(client.sessionId);
-    this.lastFireTick.delete(client.sessionId);
-    this.respawnAt.delete(client.sessionId);
+    this.lastFireMs.delete(client.sessionId);
+    this.respawnAtMs.delete(client.sessionId);
   }
 
   /** Spawn / respawn a player at an evenly-distributed ring position with full HP. */
@@ -91,6 +106,27 @@ export class ArenaRoom extends Room<ArenaState> {
     player.hp = MAX_HP;
   }
 
+  /** Ring slot farthest from all live players — prevents spawning on top of someone. */
+  private freeSpawnSlot(exclude?: string): number {
+    let bestSlot = 0;
+    let bestMinDist = -1;
+    for (let s = 0; s < this.maxClients; s++) {
+      const a = (s / this.maxClients) * Math.PI * 2;
+      const x = Math.cos(a) * (ARENA_RADIUS - 4);
+      const z = Math.sin(a) * (ARENA_RADIUS - 4);
+      let minD = Infinity;
+      this.state.players.forEach((p, id) => {
+        if (id === exclude || p.hp <= 0) return;
+        minD = Math.min(minD, Math.hypot(p.x - x, p.z - z));
+      });
+      if (minD > bestMinDist) {
+        bestMinDist = minD;
+        bestSlot = s;
+      }
+    }
+    return bestSlot;
+  }
+
   /**
    * Authoritative hitscan. The client only asks to fire in a direction; the
    * SERVER validates the cooldown, ray-casts against current authoritative
@@ -100,10 +136,12 @@ export class ArenaRoom extends Room<ArenaState> {
     if (!msg || !Number.isFinite(msg.angle)) return;
     const shooter = this.state.players.get(sid);
     if (!shooter || shooter.hp <= 0) return; // dead players can't shoot
+    if (this.state.phase !== PHASE_ACTIVE) return; // no fighting between rounds
 
-    const last = this.lastFireTick.get(sid) ?? -FIRE_COOLDOWN_TICKS;
-    if (this.state.tick - last < FIRE_COOLDOWN_TICKS) return; // rate-limited
-    this.lastFireTick.set(sid, this.state.tick);
+    const nowMs = Date.now();
+    const last = this.lastFireMs.get(sid) ?? -FIRE_COOLDOWN_MS;
+    if (nowMs - last < FIRE_COOLDOWN_MS) return; // rate-limited
+    this.lastFireMs.set(sid, nowMs);
 
     // aim direction matches the movement convention: dir = (sin(angle), cos(angle))
     const dirX = Math.sin(msg.angle);
@@ -131,8 +169,11 @@ export class ArenaRoom extends Room<ArenaState> {
       target.hp = Math.max(0, target.hp - FIRE_DAMAGE);
       if (target.hp === 0) {
         shooter.score++;
-        this.respawnAt.set(hitId, this.state.tick + RESPAWN_TICKS);
+        this.respawnAtMs.set(hitId, nowMs + RESPAWN_MS);
         this.broadcast("kill", { killer: sid, victim: hitId });
+        if (this.state.phase === PHASE_ACTIVE && shooter.score >= this.state.scoreToWin) {
+          this.endRound(sid);
+        }
       }
     }
 
@@ -161,23 +202,72 @@ export class ArenaRoom extends Room<ArenaState> {
     );
   }
 
+  /** Begin a fresh round: reset scores, respawn everyone, restart the clock. */
+  private startRound(): void {
+    this.state.phase = PHASE_ACTIVE;
+    this.state.winner = "";
+    this.state.timeLeft = ROUND_SECONDS;
+    this.roundStartMs = Date.now();
+    this.respawnAtMs.clear();
+    this.lastFireMs.clear();
+    let slot = 0;
+    this.state.players.forEach((player) => {
+      player.score = 0;
+      this.placeAtSpawn(player, slot++);
+    });
+    this.broadcast("roundStart", {});
+  }
+
+  /** End the round, freeze the result, and hold the scoreboard briefly. */
+  private endRound(winnerId: string): void {
+    this.state.phase = PHASE_ENDED;
+    this.state.winner = winnerId;
+    this.state.timeLeft = 0;
+    this.postRoundEndMs = Date.now() + POSTROUND_MS;
+    this.broadcast("roundEnd", { winner: winnerId });
+  }
+
+  /** Session id of the current highest scorer (empty string if nobody scored). */
+  private leader(): string {
+    let bestId = "";
+    let best = 0;
+    this.state.players.forEach((player, sid) => {
+      if (player.score > best) {
+        best = player.score;
+        bestId = sid;
+      }
+    });
+    return bestId;
+  }
+
+  /** Advance match timing: countdown while active, auto-restart after a result. */
+  private updateMatch(): void {
+    const nowMs = Date.now();
+    if (this.state.phase === PHASE_ACTIVE) {
+      const elapsed = Math.floor((nowMs - this.roundStartMs) / 1000);
+      const left = Math.max(0, ROUND_SECONDS - elapsed);
+      if (left !== this.state.timeLeft) this.state.timeLeft = left;
+      if (left === 0) this.endRound(this.leader()); // time-limit win goes to the leader
+    } else if (this.state.phase === PHASE_ENDED && nowMs >= this.postRoundEndMs) {
+      this.startRound();
+    }
+  }
+
   /** Fixed-timestep authoritative simulation. */
   private update(deltaMs: number): void {
     const dt = deltaMs / 1000;
     this.state.tick++;
 
+    this.updateMatch();
+
     // respawn any downed players whose timer has elapsed
-    if (this.respawnAt.size > 0) {
-      let slot = 0;
-      this.respawnAt.forEach((tick, sid) => {
-        if (this.state.tick < tick) {
-          slot++;
-          return;
-        }
+    if (this.respawnAtMs.size > 0) {
+      const nowMs = Date.now();
+      this.respawnAtMs.forEach((whenMs, sid) => {
+        if (nowMs < whenMs) return;
         const player = this.state.players.get(sid);
-        if (player) this.placeAtSpawn(player, slot);
-        this.respawnAt.delete(sid);
-        slot++;
+        if (player) this.placeAtSpawn(player, this.freeSpawnSlot(sid));
+        this.respawnAtMs.delete(sid);
       });
     }
 
