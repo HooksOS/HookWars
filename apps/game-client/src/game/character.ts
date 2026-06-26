@@ -31,6 +31,7 @@ export function loadCharacters(scene: Scene): Promise<AssetContainer> {
 export interface CharacterView {
   root: TransformNode; // netcode sets .position and .rotation.y
   setMoving: (moving: boolean) => void;
+  setDowned: (downed: boolean) => void;
   dispose: () => void;
 }
 
@@ -66,13 +67,25 @@ export function spawnCharacter(scene: Scene, container: AssetContainer, faction:
   const walk = groups.find((g) => /walk|run|move/i.test(g.name)) ?? groups[0];
 
   let moving = false;
+  let downed = false;
   return {
     root: holder,
     setMoving(next: boolean) {
-      if (next === moving || !walk) return;
+      if (downed || next === moving || !walk) return;
       moving = next;
       if (next) walk.start(true, 1, walk.from, walk.to);
       else walk.goToFrame(walk.from), walk.pause();
+    },
+    setDowned(next: boolean) {
+      if (next === downed) return;
+      downed = next;
+      // collapse the model and dim the faction ring while downed
+      modelRoot.setEnabled(!next);
+      ringMat.emissiveColor = next ? FACTION_COLORS[faction % 4].scale(0.2) : FACTION_COLORS[faction % 4];
+      if (next && walk) {
+        walk.pause();
+        moving = false;
+      }
     },
     dispose() {
       inst.dispose();

@@ -6,7 +6,9 @@ import { HemisphericLight } from "@babylonjs/core/Lights/hemisphericLight";
 import { DirectionalLight } from "@babylonjs/core/Lights/directionalLight";
 import { MeshBuilder } from "@babylonjs/core/Meshes/meshBuilder";
 import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
-import { NetClient, type NetPlayer } from "../net/client";
+import { PointerEventTypes } from "@babylonjs/core/Events/pointerEvents";
+import "@babylonjs/core/Meshes/Builders/linesBuilder";
+import { NetClient, type NetPlayer, type ShotEvent } from "../net/client";
 import { stepMovement, INTERP_DELAY_MS, type InputFrame } from "../net/protocol";
 import { loadCharacters, spawnCharacter, type CharacterView } from "./character";
 
@@ -15,20 +17,24 @@ interface RemoteBuffer {
   buf: { t: number; x: number; z: number; angle: number }[];
   lastX: number;
   lastZ: number;
+  hp: number;
+}
+
+export interface WorldHud {
+  onFps: (n: number) => void;
+  onPlayers: (n: number) => void;
+  onStatus: (s: string) => void;
+  onVitals: (hp: number, score: number) => void;
 }
 
 /**
  * The HookWars game world: Babylon render + Colyseus authoritative netcode +
- * real skinned-GLB characters.
+ * real skinned-GLB characters + server-authoritative combat.
  * - LOCAL player: client-side prediction + server reconciliation.
  * - REMOTE players: entity interpolation (~100 ms behind authoritative state).
- * - Walk animation is driven by SERVER-confirmed movement, not local guesses.
- * The client never owns authoritative position; it predicts/interpolates only.
+ * - Aiming/firing send INTENT; the server resolves all hits, HP, and score.
  */
-export function createWorld(
-  canvas: HTMLCanvasElement,
-  hud: { onFps: (n: number) => void; onPlayers: (n: number) => void; onStatus: (s: string) => void },
-): () => void {
+export function createWorld(canvas: HTMLCanvasElement, hud: WorldHud): () => void {
   const engine = new Engine(canvas, true, { adaptToDeviceRatio: true });
   const scene = new Scene(engine);
   scene.clearColor = new Color4(0.02, 0.03, 0.05, 1);
@@ -75,14 +81,14 @@ export function createWorld(
   // ---- netcode + entities ----
   const net = new NetClient();
   let localView: CharacterView | null = null;
+  let localHp = 100;
   const predicted = { x: 0, z: 0 };
+  let aimAngle = 0;
   let seq = 0;
-  const pending: InputFrame[] = []; // inputs not yet acknowledged by the server
+  const pending: InputFrame[] = [];
   const remotes = new Map<string, RemoteBuffer>();
-
   let disposed = false;
 
-  /** Server reconciliation: snap to authoritative state, replay un-acked inputs. */
   function reconcile(p: NetPlayer): void {
     predicted.x = p.x;
     predicted.z = p.z;
@@ -96,6 +102,19 @@ export function createWorld(
 
   function headcount(): number {
     return remotes.size + (localView ? 1 : 0);
+  }
+
+  // brief tracer line for shot feedback (cosmetic; authority already resolved)
+  function spawnTracer(s: ShotEvent): void {
+    const ex = s.x + Math.sin(s.angle) * s.dist;
+    const ez = s.z + Math.cos(s.angle) * s.dist;
+    const line = MeshBuilder.CreateLines(
+      "tracer",
+      { points: [new Vector3(s.x, 0.9, s.z), new Vector3(ex, 0.9, ez)] },
+      scene,
+    );
+    line.color = s.hit ? new Color3(1, 0.3, 0.25) : new Color3(0.4, 0.85, 1);
+    window.setTimeout(() => line.dispose(), 70);
   }
 
   (async () => {
@@ -120,10 +139,12 @@ export function createWorld(
             localView.root.position.set(p.x, 0, p.z);
             predicted.x = p.x;
             predicted.z = p.z;
+            localHp = p.hp;
+            hud.onVitals(p.hp, p.score);
           } else {
             const view = spawnCharacter(scene, container, p.faction);
             view.root.position.set(p.x, 0, p.z);
-            remotes.set(p.id, { view, buf: [{ t: now(), ...vec(p) }], lastX: p.x, lastZ: p.z });
+            remotes.set(p.id, { view, buf: [{ t: now(), ...vec(p) }], lastX: p.x, lastZ: p.z, hp: p.hp });
           }
           hud.onPlayers(headcount());
         },
@@ -135,14 +156,20 @@ export function createWorld(
         onChange: (p) => {
           if (p.id === net.sessionId) {
             reconcile(p);
+            localHp = p.hp;
+            localView?.setDowned(p.hp <= 0);
+            hud.onVitals(p.hp, p.score);
           } else {
             const r = remotes.get(p.id);
             if (r) {
               r.buf.push({ t: now(), ...vec(p) });
               if (r.buf.length > 30) r.buf.shift();
+              r.hp = p.hp;
+              r.view.setDowned(p.hp <= 0);
             }
           }
         },
+        onShot: spawnTracer,
       });
       hud.onStatus("connected · authoritative");
     } catch (err) {
@@ -151,30 +178,40 @@ export function createWorld(
     }
   })();
 
+  // ---- aim + fire (twin-stick: mouse aims, click fires) ----
+  scene.onPointerObservable.add((info) => {
+    if (info.type === PointerEventTypes.POINTERMOVE) {
+      if (!localView) return;
+      const pick = scene.pick(scene.pointerX, scene.pointerY, (m) => m === floor);
+      if (pick?.hit && pick.pickedPoint) {
+        aimAngle = Math.atan2(pick.pickedPoint.x - localView.root.position.x, pick.pickedPoint.z - localView.root.position.z);
+      }
+    } else if (info.type === PointerEventTypes.POINTERDOWN) {
+      if (localView && localHp > 0) net.sendFire(aimAngle);
+    }
+  });
+
   let fpsAcc = 0;
   scene.registerBeforeRender(() => {
     const dt = Math.min(engine.getDeltaTime() / 1000, 0.1);
 
-    // local player: predict + send input, animate on actual movement
     if (localView) {
       const { dx, dz } = sampleInput();
-      const moving = dx !== 0 || dz !== 0;
+      const moving = (dx !== 0 || dz !== 0) && localHp > 0;
       if (moving) {
-        const angle = Math.atan2(dx, dz);
-        const frame: InputFrame = { seq: ++seq, dx, dz, angle, dt };
+        const frame: InputFrame = { seq: ++seq, dx, dz, angle: aimAngle, dt };
         const next = stepMovement(predicted, dx, dz, dt);
         predicted.x = next.x;
         predicted.z = next.z;
         pending.push(frame);
         net.sendInput(frame);
-        localView.root.rotation.y = angle;
       }
       localView.root.position.x += (predicted.x - localView.root.position.x) * 0.5;
       localView.root.position.z += (predicted.z - localView.root.position.z) * 0.5;
+      localView.root.rotation.y = aimAngle; // face the cursor
       localView.setMoving(moving);
     }
 
-    // remote players: interpolate ~100 ms in the past, animate on confirmed motion
     const renderTime = now() - INTERP_DELAY_MS;
     remotes.forEach((r) => {
       const b = r.buf;
@@ -198,7 +235,7 @@ export function createWorld(
       r.view.root.position.x = x;
       r.view.root.position.z = z;
       r.view.root.rotation.y = a.angle;
-      r.view.setMoving(speed > 0.001);
+      r.view.setMoving(r.hp > 0 && speed > 0.001);
     });
 
     fpsAcc += dt;
