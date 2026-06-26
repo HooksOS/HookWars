@@ -22,11 +22,23 @@ export interface ShotEvent {
   dist: number;
 }
 
+/** Authoritative match state, mirrored to the HUD. */
+export interface MatchState {
+  phase: number;
+  timeLeft: number;
+  scoreToWin: number;
+  winner: string;
+  teams: [number, number, number, number]; // kills aggregated by faction R/B/G/K
+  players: number;
+}
+
 export interface NetCallbacks {
   onAdd: (p: NetPlayer) => void;
   onRemove: (id: string) => void;
   onChange: (p: NetPlayer) => void;
   onShot?: (s: ShotEvent) => void;
+  onMatch?: (m: MatchState) => void;
+  onKill?: (killer: string, victim: string) => void;
 }
 
 const ENDPOINT = import.meta.env.VITE_REALTIME_URL ?? "ws://localhost:2567";
@@ -47,12 +59,21 @@ export class NetClient {
     this.sessionId = room.sessionId;
 
     if (cb.onShot) room.onMessage("shot", cb.onShot);
-    room.onMessage("kill", () => {}); // registered to silence the unhandled-type warning
+    room.onMessage("roundStart", () => {});
+    room.onMessage("roundEnd", () => {});
+    if (cb.onKill) room.onMessage("kill", (m: { killer: string; victim: string }) => cb.onKill!(m.killer, m.victim));
+    else room.onMessage("kill", () => {});
 
     const state = room.state as {
+      phase: number;
+      timeLeft: number;
+      scoreToWin: number;
+      winner: string;
       players: {
+        size: number;
         onAdd: (cb: (p: NetPlayer, key: string) => void) => void;
         onRemove: (cb: (p: NetPlayer, key: string) => void) => void;
+        forEach: (cb: (p: NetPlayer, key: string) => void) => void;
       };
     };
 
@@ -62,6 +83,23 @@ export class NetClient {
       player.onChange(() => cb.onChange(snapshot(player, key)));
     });
     state.players.onRemove((_p, key) => cb.onRemove(key));
+
+    if (cb.onMatch) {
+      room.onStateChange(() => {
+        const teams: [number, number, number, number] = [0, 0, 0, 0];
+        state.players.forEach((p) => {
+          teams[p.faction % 4] += p.score;
+        });
+        cb.onMatch!({
+          phase: state.phase,
+          timeLeft: state.timeLeft,
+          scoreToWin: state.scoreToWin,
+          winner: state.winner,
+          teams,
+          players: state.players.size,
+        });
+      });
+    }
   }
 
   sendInput(input: InputFrame): void {

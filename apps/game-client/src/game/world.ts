@@ -11,6 +11,7 @@ import "@babylonjs/core/Meshes/Builders/linesBuilder";
 import { NetClient, type NetPlayer, type ShotEvent } from "../net/client";
 import { stepMovement, INTERP_DELAY_MS, type InputFrame } from "../net/protocol";
 import { loadCharacters, spawnCharacter, type CharacterView } from "./character";
+import { useHud, type Blip } from "../store";
 
 interface RemoteBuffer {
   view: CharacterView;
@@ -18,23 +19,20 @@ interface RemoteBuffer {
   lastX: number;
   lastZ: number;
   hp: number;
+  faction: number;
 }
 
-export interface WorldHud {
-  onFps: (n: number) => void;
-  onPlayers: (n: number) => void;
-  onStatus: (s: string) => void;
-  onVitals: (hp: number, score: number) => void;
-}
+const AMMO_MAX = 30;
+const RELOAD_MS = 1500;
 
 /**
  * The HookWars game world: Babylon render + Colyseus authoritative netcode +
- * real skinned-GLB characters + server-authoritative combat.
- * - LOCAL player: client-side prediction + server reconciliation.
- * - REMOTE players: entity interpolation (~100 ms behind authoritative state).
- * - Aiming/firing send INTENT; the server resolves all hits, HP, and score.
+ * skinned-GLB characters + server-authoritative combat, feeding the COMMAND HUD.
+ * Client predicts/interpolates and renders only; all combat/score/match state
+ * is the server's. Ammo is the lone cosmetic, client-side value.
  */
-export function createWorld(canvas: HTMLCanvasElement, hud: WorldHud): () => void {
+export function createWorld(canvas: HTMLCanvasElement): () => void {
+  const hud = useHud.getState();
   const engine = new Engine(canvas, true, { adaptToDeviceRatio: true });
   const scene = new Scene(engine);
   scene.clearColor = new Color4(0.02, 0.03, 0.05, 1);
@@ -82,12 +80,17 @@ export function createWorld(canvas: HTMLCanvasElement, hud: WorldHud): () => voi
   const net = new NetClient();
   let localView: CharacterView | null = null;
   let localHp = 100;
+  let localFaction = 0;
   const predicted = { x: 0, z: 0 };
   let aimAngle = 0;
   let seq = 0;
   const pending: InputFrame[] = [];
   const remotes = new Map<string, RemoteBuffer>();
   let disposed = false;
+
+  // cosmetic ammo
+  let ammo = AMMO_MAX;
+  let reloading = false;
 
   function reconcile(p: NetPlayer): void {
     predicted.x = p.x;
@@ -100,19 +103,10 @@ export function createWorld(canvas: HTMLCanvasElement, hud: WorldHud): () => voi
     }
   }
 
-  function headcount(): number {
-    return remotes.size + (localView ? 1 : 0);
-  }
-
-  // brief tracer line for shot feedback (cosmetic; authority already resolved)
   function spawnTracer(s: ShotEvent): void {
     const ex = s.x + Math.sin(s.angle) * s.dist;
     const ez = s.z + Math.cos(s.angle) * s.dist;
-    const line = MeshBuilder.CreateLines(
-      "tracer",
-      { points: [new Vector3(s.x, 0.9, s.z), new Vector3(ex, 0.9, ez)] },
-      scene,
-    );
+    const line = MeshBuilder.CreateLines("tracer", { points: [new Vector3(s.x, 0.9, s.z), new Vector3(ex, 0.9, ez)] }, scene);
     line.color = s.hit ? new Color3(1, 0.3, 0.25) : new Color3(0.4, 0.85, 1);
     window.setTimeout(() => line.dispose(), 70);
   }
@@ -123,7 +117,7 @@ export function createWorld(canvas: HTMLCanvasElement, hud: WorldHud): () => voi
       container = await loadCharacters(scene);
     } catch (err) {
       console.error("[assets] character load failed:", err);
-      hud.onStatus("asset load failed — see console");
+      hud.setStatus("asset load failed — see console");
       return;
     }
     if (disposed) {
@@ -140,25 +134,24 @@ export function createWorld(canvas: HTMLCanvasElement, hud: WorldHud): () => voi
             predicted.x = p.x;
             predicted.z = p.z;
             localHp = p.hp;
-            hud.onVitals(p.hp, p.score);
+            localFaction = p.faction;
+            hud.setLocal(p.hp, p.score);
           } else {
             const view = spawnCharacter(scene, container, p.faction);
             view.root.position.set(p.x, 0, p.z);
-            remotes.set(p.id, { view, buf: [{ t: now(), ...vec(p) }], lastX: p.x, lastZ: p.z, hp: p.hp });
+            remotes.set(p.id, { view, buf: [{ t: now(), ...vec(p) }], lastX: p.x, lastZ: p.z, hp: p.hp, faction: p.faction });
           }
-          hud.onPlayers(headcount());
         },
         onRemove: (id) => {
           remotes.get(id)?.view.dispose();
           remotes.delete(id);
-          hud.onPlayers(headcount());
         },
         onChange: (p) => {
           if (p.id === net.sessionId) {
             reconcile(p);
             localHp = p.hp;
             localView?.setDowned(p.hp <= 0);
-            hud.onVitals(p.hp, p.score);
+            hud.setLocal(p.hp, p.score);
           } else {
             const r = remotes.get(p.id);
             if (r) {
@@ -170,15 +163,40 @@ export function createWorld(canvas: HTMLCanvasElement, hud: WorldHud): () => voi
           }
         },
         onShot: spawnTracer,
+        onMatch: (m) =>
+          hud.setMatch({
+            phase: m.phase,
+            timeLeft: m.timeLeft,
+            winnerIsLocal: m.winner === net.sessionId && m.winner !== "",
+            teams: m.teams,
+            players: m.players,
+          }),
+        onKill: (killer, victim) =>
+          hud.pushKill({ killer: shortId(killer), victim: shortId(victim), you: killer === net.sessionId }),
       });
-      hud.onStatus("connected · authoritative");
+      hud.setStatus("connected · authoritative");
     } catch (err) {
       console.error("[net] connect failed:", err);
-      hud.onStatus("offline — start services/realtime (ws://localhost:2567)");
+      hud.setStatus("offline — start services/realtime (ws://localhost:2567)");
     }
   })();
 
-  // ---- aim + fire (twin-stick: mouse aims, click fires) ----
+  // ---- aim + fire (twin-stick) ----
+  function fire(): void {
+    if (!localView || localHp <= 0 || reloading || ammo <= 0) return;
+    net.sendFire(aimAngle);
+    ammo--;
+    hud.setAmmo(ammo);
+    if (ammo === 0) {
+      reloading = true;
+      window.setTimeout(() => {
+        ammo = AMMO_MAX;
+        reloading = false;
+        hud.setAmmo(ammo);
+      }, RELOAD_MS);
+    }
+  }
+
   scene.onPointerObservable.add((info) => {
     if (info.type === PointerEventTypes.POINTERMOVE) {
       if (!localView) return;
@@ -187,11 +205,12 @@ export function createWorld(canvas: HTMLCanvasElement, hud: WorldHud): () => voi
         aimAngle = Math.atan2(pick.pickedPoint.x - localView.root.position.x, pick.pickedPoint.z - localView.root.position.z);
       }
     } else if (info.type === PointerEventTypes.POINTERDOWN) {
-      if (localView && localHp > 0) net.sendFire(aimAngle);
+      fire();
     }
   });
 
   let fpsAcc = 0;
+  let blipAcc = 0;
   scene.registerBeforeRender(() => {
     const dt = Math.min(engine.getDeltaTime() / 1000, 0.1);
 
@@ -208,7 +227,7 @@ export function createWorld(canvas: HTMLCanvasElement, hud: WorldHud): () => voi
       }
       localView.root.position.x += (predicted.x - localView.root.position.x) * 0.5;
       localView.root.position.z += (predicted.z - localView.root.position.z) * 0.5;
-      localView.root.rotation.y = aimAngle; // face the cursor
+      localView.root.rotation.y = aimAngle;
       localView.setMoving(moving);
     }
 
@@ -238,10 +257,20 @@ export function createWorld(canvas: HTMLCanvasElement, hud: WorldHud): () => voi
       r.view.setMoving(r.hp > 0 && speed > 0.001);
     });
 
+    // minimap blips ~10 Hz
+    blipAcc += dt;
+    if (blipAcc > 0.1) {
+      blipAcc = 0;
+      const blips: Blip[] = [];
+      if (localView) blips.push({ x: predicted.x, z: predicted.z, faction: localFaction, local: true, alive: localHp > 0 });
+      remotes.forEach((r) => blips.push({ x: r.lastX, z: r.lastZ, faction: r.faction, local: false, alive: r.hp > 0 }));
+      hud.setBlips(blips);
+    }
+
     fpsAcc += dt;
     if (fpsAcc > 0.25) {
       fpsAcc = 0;
-      hud.onFps(Math.round(engine.getFps()));
+      hud.setFps(Math.round(engine.getFps()));
     }
   });
 
@@ -264,4 +293,7 @@ function now(): number {
 }
 function vec(p: NetPlayer): { x: number; z: number; angle: number } {
   return { x: p.x, z: p.z, angle: p.angle };
+}
+function shortId(id: string): string {
+  return id.slice(0, 5).toUpperCase();
 }

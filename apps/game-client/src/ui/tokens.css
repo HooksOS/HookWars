@@ -1,0 +1,64 @@
+/* HookWars design tokens — COMMAND direction (dark tactical).
+   Source of truth: design_handoff_hookwars/README.md §Design Tokens. */
+@import url("https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@500;600;700;800&family=Saira:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap");
+
+:root {
+  /* surfaces */
+  --void: #0a0d13;
+  --void-deep: #070a0e;
+  --panel-1: #0e121b;
+  --panel-2: #11151e;
+  --panel-3: #141926;
+  --steel: #1c2433;
+  --steel-2: #2a3242;
+  --hairline: rgba(255, 255, 255, 0.12);
+  --hairline-soft: rgba(255, 255, 255, 0.08);
+
+  /* text */
+  --text-hi: #f4f6fa;
+  --text-mid: #98a4b8;
+  --text-mid-2: #9faac0;
+  --text-dim: #5b6678;
+  --text-soft: #c9d3e2;
+
+  /* brand */
+  --amber: #ffb22e;
+  --amber-on: #0a0d13;
+
+  /* factions */
+  --red: #ff4d43;
+  --red-deep: #c8362e;
+  --blue: #2e8bff;
+  --blue-deep: #1e63c8;
+  --green: #2bd66a;
+  --green-deep: #1fa651;
+  --black: #6e7a8f;
+
+  /* rarity */
+  --r-common: #9faac0;
+  --r-rare: #2bd66a;
+  --r-epic: #2e8bff;
+  --r-legendary: #b57bff;
+  --r-mythic: #ffb22e;
+
+  /* type */
+  --font-display: "Saira Condensed", sans-serif;
+  --font-ui: "Saira", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+
+  /* fx */
+  --shadow-frame: 0 30px 90px rgba(0, 0, 0, 0.5);
+  --glow-amber: 0 12px 36px rgba(255, 178, 46, 0.35);
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+/* signature motifs */
+.hw-hazard {
+  background: repeating-linear-gradient(135deg, var(--amber) 0 18px, var(--void) 18px 36px);
+}
+.hw-grid {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+  background-size: 46px 46px;
+}
