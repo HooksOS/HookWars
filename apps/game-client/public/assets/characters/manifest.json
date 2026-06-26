@@ -1,0 +1,18 @@
+{
+  "$schema": "./manifest.schema.note.md",
+  "comment": "HookWars character roster manifest. Drop a GLB in this folder, add an entry here, and it is available to the client. Every shipping asset MUST have a commercial-safe license (CC0, royalty-free game license, or paid-commercial AI tier). See CREDITS.md.",
+  "default": "scout",
+  "characters": [
+    {
+      "id": "scout",
+      "name": "Scout (sample)",
+      "role": "placeholder",
+      "file": "cesium-man.glb",
+      "animations": { "walk": "walk" },
+      "license": "CC-BY-4.0",
+      "source": "Khronos glTF-Sample-Assets — CesiumMan",
+      "attribution": "CesiumMan by Cesium (https://cesium.com), CC-BY 4.0",
+      "shipping": false
+    }
+  ]
+}

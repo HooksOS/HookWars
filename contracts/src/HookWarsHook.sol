@@ -213,6 +213,8 @@ contract HookWarsHook is BaseHook, Ownable {
         // Only charge when the unspecified leg is a positive output (i.e. exact-input swaps).
         if (unspecifiedAmount <= 0) return (selector, int128(0));
 
+        // Safe: `unspecifiedAmount` is a positive int128 (guarded above), so it fits int128->uint128.
+        // forge-lint: disable-next-line(unsafe-typecast)
         uint256 outAmount = uint256(uint128(unspecifiedAmount));
         uint256 feeAmount = FeeMath.feeOn(outAmount, fee);
         if (feeAmount == 0) return (selector, int128(0));
@@ -222,7 +224,8 @@ contract HookWarsHook is BaseHook, Ownable {
         poolManager.take(feeCurrency, treasury, feeAmount);
         emit FeeRouted(Currency.unwrap(feeCurrency), treasury, feeAmount);
 
-        // feeAmount <= outAmount <= type(uint128).max, so the cast is safe and positive.
+        // Safe: feeAmount <= outAmount <= type(uint128).max, so both casts are in range and positive.
+        // forge-lint: disable-next-line(unsafe-typecast)
         hookDelta = int128(int256(feeAmount));
     }
 }

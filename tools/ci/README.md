@@ -9,6 +9,7 @@
 | File | Purpose |
 |---|---|
 | `verify-audit-signoff.mjs` | The audit-sign-off gate. Fails CI unless every **changed** contract under `contracts/src` has a `"passed"` entry in [`audit/signoff.json`](../../audit/signoff.json). Real, dependency-free Node ESM. |
+| `setup-branch-protection.sh` | One-time admin script (`gh api`) that makes the gate **binding**: configures branch protection on `main` requiring the status checks `slither`, `forge-fork`, `unit-int`, `audit-signoff`, `lint` (strict/up-to-date), with `enforce_admins=true` and required PR reviews. Idempotent. See "Required GitHub repo settings" below. |
 | `README.md` | This file. |
 
 Related workflows: [`.github/workflows/release.yml`](../../.github/workflows/release.yml) (deploy
@@ -58,8 +59,22 @@ the key lives nowhere else. This is the ultimate structural lock.
 An organization/repo admin MUST configure the following. Until these are set, the gate is only
 *advisory*; these settings make it *binding*.
 
+> **Automated path (recommended):** instead of clicking through the UI below, an admin can run
+> [`setup-branch-protection.sh`](./setup-branch-protection.sh) once — it applies exactly the rule in
+> §A via `gh api` (idempotent; re-runnable):
+>
+> ```bash
+> # Authenticated as a repo admin (gh auth status). Auto-detects owner/repo:
+> tools/ci/setup-branch-protection.sh
+> # or target explicitly / require 2 approvals:
+> REPO=HooksOS/HookWars REVIEWS=2 tools/ci/setup-branch-protection.sh
+> ```
+>
+> It still does NOT create the protected `production` environment (§B) — GitHub requires that be set
+> up separately; do it via the UI as described in §B.
+
 ### A. Branch protection rule on `main`
-Settings → Branches → Add rule → Branch name pattern `main`:
+Settings → Branches → Add rule → Branch name pattern `main` (or run the script above):
 - **Require a pull request before merging** ✓ (≥1 approval recommended)
 - **Require status checks to pass before merging** ✓ → **Require branches to be up to date** ✓
 - Add these **required status checks** (exact names — they must match the job `name:` values in

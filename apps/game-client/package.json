@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@babylonjs/core": "^7.54.0",
+    "@babylonjs/loaders": "^7.54.0",
     "colyseus.js": "^0.15.28",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

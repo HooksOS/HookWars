@@ -6,29 +6,24 @@ import { HemisphericLight } from "@babylonjs/core/Lights/hemisphericLight";
 import { DirectionalLight } from "@babylonjs/core/Lights/directionalLight";
 import { MeshBuilder } from "@babylonjs/core/Meshes/meshBuilder";
 import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
-import type { Mesh } from "@babylonjs/core/Meshes/mesh";
 import { NetClient, type NetPlayer } from "../net/client";
 import { stepMovement, INTERP_DELAY_MS, type InputFrame } from "../net/protocol";
-
-const FACTION_COLORS = [
-  new Color3(0.9, 0.25, 0.3), // Red
-  new Color3(0.25, 0.5, 0.95), // Blue
-  new Color3(0.3, 0.85, 0.4), // Green
-  new Color3(0.5, 0.3, 0.85), // Black/violet
-];
+import { loadCharacters, spawnCharacter, type CharacterView } from "./character";
 
 interface RemoteBuffer {
-  mesh: Mesh;
-  faction: number;
-  /** timestamped authoritative snapshots for interpolation */
+  view: CharacterView;
   buf: { t: number; x: number; z: number; angle: number }[];
+  lastX: number;
+  lastZ: number;
 }
 
 /**
- * The HookWars game world: Babylon render + Colyseus authoritative netcode.
+ * The HookWars game world: Babylon render + Colyseus authoritative netcode +
+ * real skinned-GLB characters.
  * - LOCAL player: client-side prediction + server reconciliation.
  * - REMOTE players: entity interpolation (~100 ms behind authoritative state).
- * The client never decides authoritative position; it only predicts/interpolates.
+ * - Walk animation is driven by SERVER-confirmed movement, not local guesses.
+ * The client never owns authoritative position; it predicts/interpolates only.
  */
 export function createWorld(
   canvas: HTMLCanvasElement,
@@ -60,26 +55,12 @@ export function createWorld(
   ringMat.emissiveColor = new Color3(0.1, 0.7, 1.0);
   ring.material = ringMat;
 
-  // ---- player meshes ----
-  const meshTemplate = MeshBuilder.CreateBox("unit", { size: 1.1 }, scene) as Mesh;
-  meshTemplate.setEnabled(false);
-
-  function makeUnit(faction: number): Mesh {
-    const m = meshTemplate.clone(`unit-${Math.random().toString(36).slice(2)}`);
-    m.setEnabled(true);
-    m.position.y = 0.7;
-    const mat = new StandardMaterial(`m${faction}`, scene);
-    const c = FACTION_COLORS[faction % 4];
-    mat.emissiveColor = c.scale(0.9);
-    mat.diffuseColor = c.scale(0.2);
-    m.material = mat;
-    return m;
-  }
-
   // ---- input ----
   const keys = new Set<string>();
-  window.addEventListener("keydown", (e) => keys.add(e.key.toLowerCase()));
-  window.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
+  const onKeyDown = (e: KeyboardEvent) => keys.add(e.key.toLowerCase());
+  const onKeyUp = (e: KeyboardEvent) => keys.delete(e.key.toLowerCase());
+  window.addEventListener("keydown", onKeyDown);
+  window.addEventListener("keyup", onKeyUp);
 
   function sampleInput(): { dx: number; dz: number } {
     let dx = 0;
@@ -91,56 +72,21 @@ export function createWorld(
     return { dx, dz };
   }
 
-  // ---- local prediction state ----
+  // ---- netcode + entities ----
   const net = new NetClient();
-  let localMesh: Mesh | null = null;
+  let localView: CharacterView | null = null;
   const predicted = { x: 0, z: 0 };
   let seq = 0;
   const pending: InputFrame[] = []; // inputs not yet acknowledged by the server
-
   const remotes = new Map<string, RemoteBuffer>();
 
-  net
-    .connect({
-      onAdd: (p) => {
-        if (p.id === net.sessionId) {
-          localMesh = makeUnit(p.faction);
-          predicted.x = p.x;
-          predicted.z = p.z;
-        } else {
-          remotes.set(p.id, { mesh: makeUnit(p.faction), faction: p.faction, buf: [{ t: now(), ...vec(p) }] });
-        }
-        hud.onPlayers(remotes.size + (localMesh ? 1 : 0));
-      },
-      onRemove: (id) => {
-        remotes.get(id)?.mesh.dispose();
-        remotes.delete(id);
-        hud.onPlayers(remotes.size + (localMesh ? 1 : 0));
-      },
-      onChange: (p) => {
-        if (p.id === net.sessionId) reconcile(p);
-        else {
-          const r = remotes.get(p.id);
-          if (r) {
-            r.buf.push({ t: now(), ...vec(p) });
-            if (r.buf.length > 30) r.buf.shift();
-          }
-        }
-      },
-    })
-    .then(() => hud.onStatus("connected · authoritative"))
-    .catch((err) => {
-      console.error("[net] connect failed:", err);
-      hud.onStatus("offline — start services/realtime (ws://localhost:2567)");
-    });
+  let disposed = false;
 
   /** Server reconciliation: snap to authoritative state, replay un-acked inputs. */
   function reconcile(p: NetPlayer): void {
     predicted.x = p.x;
     predicted.z = p.z;
-    // drop inputs the server has already processed
     while (pending.length && pending[0].seq <= p.lastProcessedInput) pending.shift();
-    // replay the rest on top of the authoritative position
     for (const inp of pending) {
       const next = stepMovement(predicted, inp.dx, inp.dz, inp.dt);
       predicted.x = next.x;
@@ -148,14 +94,72 @@ export function createWorld(
     }
   }
 
+  function headcount(): number {
+    return remotes.size + (localView ? 1 : 0);
+  }
+
+  (async () => {
+    let container;
+    try {
+      container = await loadCharacters(scene);
+    } catch (err) {
+      console.error("[assets] character load failed:", err);
+      hud.onStatus("asset load failed — see console");
+      return;
+    }
+    if (disposed) {
+      container.dispose();
+      return;
+    }
+
+    try {
+      await net.connect({
+        onAdd: (p) => {
+          if (p.id === net.sessionId) {
+            localView = spawnCharacter(scene, container, p.faction);
+            localView.root.position.set(p.x, 0, p.z);
+            predicted.x = p.x;
+            predicted.z = p.z;
+          } else {
+            const view = spawnCharacter(scene, container, p.faction);
+            view.root.position.set(p.x, 0, p.z);
+            remotes.set(p.id, { view, buf: [{ t: now(), ...vec(p) }], lastX: p.x, lastZ: p.z });
+          }
+          hud.onPlayers(headcount());
+        },
+        onRemove: (id) => {
+          remotes.get(id)?.view.dispose();
+          remotes.delete(id);
+          hud.onPlayers(headcount());
+        },
+        onChange: (p) => {
+          if (p.id === net.sessionId) {
+            reconcile(p);
+          } else {
+            const r = remotes.get(p.id);
+            if (r) {
+              r.buf.push({ t: now(), ...vec(p) });
+              if (r.buf.length > 30) r.buf.shift();
+            }
+          }
+        },
+      });
+      hud.onStatus("connected · authoritative");
+    } catch (err) {
+      console.error("[net] connect failed:", err);
+      hud.onStatus("offline — start services/realtime (ws://localhost:2567)");
+    }
+  })();
+
   let fpsAcc = 0;
   scene.registerBeforeRender(() => {
     const dt = Math.min(engine.getDeltaTime() / 1000, 0.1);
 
-    // local player: predict + send input
-    if (localMesh) {
+    // local player: predict + send input, animate on actual movement
+    if (localView) {
       const { dx, dz } = sampleInput();
-      if (dx !== 0 || dz !== 0) {
+      const moving = dx !== 0 || dz !== 0;
+      if (moving) {
         const angle = Math.atan2(dx, dz);
         const frame: InputFrame = { seq: ++seq, dx, dz, angle, dt };
         const next = stepMovement(predicted, dx, dz, dt);
@@ -163,13 +167,14 @@ export function createWorld(
         predicted.z = next.z;
         pending.push(frame);
         net.sendInput(frame);
-        localMesh.rotation.y = angle;
+        localView.root.rotation.y = angle;
       }
-      localMesh.position.x += (predicted.x - localMesh.position.x) * 0.5;
-      localMesh.position.z += (predicted.z - localMesh.position.z) * 0.5;
+      localView.root.position.x += (predicted.x - localView.root.position.x) * 0.5;
+      localView.root.position.z += (predicted.z - localView.root.position.z) * 0.5;
+      localView.setMoving(moving);
     }
 
-    // remote players: interpolate ~100ms in the past
+    // remote players: interpolate ~100 ms in the past, animate on confirmed motion
     const renderTime = now() - INTERP_DELAY_MS;
     remotes.forEach((r) => {
       const b = r.buf;
@@ -185,9 +190,15 @@ export function createWorld(
       }
       const span = c.t - a.t || 1;
       const f = Math.max(0, Math.min(1, (renderTime - a.t) / span));
-      r.mesh.position.x = a.x + (c.x - a.x) * f;
-      r.mesh.position.z = a.z + (c.z - a.z) * f;
-      r.mesh.rotation.y = a.angle;
+      const x = a.x + (c.x - a.x) * f;
+      const z = a.z + (c.z - a.z) * f;
+      const speed = Math.hypot(x - r.lastX, z - r.lastZ);
+      r.lastX = x;
+      r.lastZ = z;
+      r.view.root.position.x = x;
+      r.view.root.position.z = z;
+      r.view.root.rotation.y = a.angle;
+      r.view.setMoving(speed > 0.001);
     });
 
     fpsAcc += dt;
@@ -202,7 +213,10 @@ export function createWorld(
   window.addEventListener("resize", onResize);
 
   return () => {
+    disposed = true;
     window.removeEventListener("resize", onResize);
+    window.removeEventListener("keydown", onKeyDown);
+    window.removeEventListener("keyup", onKeyUp);
     net.dispose();
     engine.dispose();
   };

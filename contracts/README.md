@@ -16,7 +16,7 @@ revert as "not implemented"** — that is a hard rule here.
 |---|---|
 | `src/HookWarsHook.sol` | Uniswap v4 hook (v4-periphery `BaseHook`). `beforeSwap` anti-bot guard + `afterSwap` fee routing to the treasury. Includes the pure `FeeMath` library. |
 | `src/Treasury.sol` | OpenZeppelin `Ownable` + `ReentrancyGuard` vault that receives and withdraws ETH / ERC-20. |
-| `test/HookWarsHook.t.sol` | forge-std unit tests for the fee math, the anti-bot predicate, and Treasury custody. |
+| `test/HookWarsHook.t.sol` | forge-std unit tests: the `FeeMath` arithmetic, the real anti-bot guard and hook-permissions of a hook deployed at a permission-encoded address (`deployCodeTo`), admin guards, and Treasury custody. |
 | `foundry.toml` · `remappings.txt` | solc 0.8.26, Cancun, optimizer + IR, `[profile.ci]`, fuzz/invariant defaults, `base` RPC endpoint. |
 | `slither.config.json` | Static-analysis config for the deploy gate (fails on high/medium). |
 | `.env.example` | `BASE_RPC`, `DEPLOYER_KEY`, etc. — copy to `.env`. |
@@ -32,21 +32,38 @@ revert as "not implemented"** — that is a hard rule here.
 
 ## 1. Install dependencies
 
-Dependencies are vendored as git submodules under `lib/` via `forge install`. From `contracts/`:
+Dependencies are fetched at **pinned commits** by `install-deps.sh` (not vendored — `lib/` is gitignored).
+This is deterministic: every environment and CI reproduces the exact commits that compile and pass tests.
+From `contracts/`:
 
 ```bash
-forge install foundry-rs/forge-std
-forge install OpenZeppelin/openzeppelin-contracts
-forge install vectorized/solady
-forge install Uniswap/v4-core
-forge install Uniswap/v4-periphery
-forge install Uniswap/permit2
+bash install-deps.sh   # pinned clones of forge-std, OZ, solady, permit2, and the matched v4 pair
 ```
 
-`remappings.txt` already maps these to the import paths used by the source
-(`v4-periphery/…`, `v4-core/…`, `@openzeppelin/contracts/…`, `solady/…`, `forge-std/…`).
+### Pinned Uniswap v4 versions (matched pair — do not bump independently)
 
-Pin exact versions/commits before audit so the build is reproducible (the deploy gate depends on it).
+`v4-core` and `v4-periphery` **must** be a compatible pair, otherwise `BaseHook` and the core types
+(`SwapParams`, `PoolKey`, `BeforeSwapDelta`, …) drift and the hook no longer compiles.
+
+| Submodule | Pinned commit | Why this commit |
+|---|---|---|
+| `lib/v4-periphery` | `3779387e5d296f39df543d23524b050f89a62917` | Last commit that still ships `src/utils/BaseHook.sol` (it was removed one commit later in #510 "remove hooks and move to hook repo"). |
+| `lib/v4-core` | `59d3ecf53afa9264a16bba0e38f4c5d2231f80bc` | The exact core commit that `v4-periphery@3779387` vendors (`lib/v4-periphery/lib/v4-core`); it has `src/types/PoolOperation.sol` (the `SwapParams`/`ModifyLiquidityParams` home in this layout). |
+
+**Remapping note (`remappings.txt`):** both `v4-core/` and `@uniswap/v4-core/` are pointed at the
+**single** vendored core inside periphery (`lib/v4-periphery/lib/v4-core/`). This is deliberate: our
+hook imports `v4-core/…` and periphery's `BaseHook` imports `@uniswap/v4-core/…`, and they must resolve
+to the **same physical source units** or Solidity treats `SwapParams`/`PoolKey` as distinct types and the
+`_beforeSwap`/`_afterSwap` overrides fail to type-check.
+
+```
+v4-core/=lib/v4-periphery/lib/v4-core/src/
+@uniswap/v4-core/=lib/v4-periphery/lib/v4-core/
+v4-periphery/=lib/v4-periphery/src/
+```
+
+CI reproduces these via the pinned `install-deps.sh`, which fetches periphery's nested `lib/v4-core`
+recursively, so `forge build` resolves the matched pair.
 
 ---
 
@@ -57,8 +74,14 @@ forge build
 forge test -vvv
 ```
 
-The default unit tests (`test/HookWarsHook.t.sol`) cover the fee-routing arithmetic, the per-block
-anti-bot predicate, and real Treasury ETH custody. They do **not** require a forked network.
+The default unit tests (`test/HookWarsHook.t.sol`) cover the `FeeMath` fee-routing arithmetic, the real
+per-block anti-bot guard and declared hook permissions (the hook is deployed at a permission-encoded
+address with `deployCodeTo` and driven through its `onlyPoolManager` `beforeSwap` entrypoint), the admin
+fee-cap/zero-address guards, and real Treasury ETH custody. They do **not** require a forked network.
+
+The full `afterSwap` fee skim to the treasury via `poolManager.take` needs an initialized pool with
+liquidity and a live PoolManager unlock context, so it lives in the fork suite (§3); the exact fee
+arithmetic it routes is pinned by the `FeeMath` tests here.
 
 Run with the CI profile (heavier optimization, 50k fuzz runs) the way the gate does:
 

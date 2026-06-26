@@ -59,7 +59,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4 # pin to SHA in prod
         with:
-          submodules: recursive
+          submodules: recursive # contracts/lib/* are git submodules (.gitmodules)
+
+      - uses: foundry-rs/foundry-toolchain@v1 # pin to SHA in prod — needed for the forge-install fallback
+        with:
+          version: stable
+
+      - name: Ensure contract libraries present
+        working-directory: contracts
+        run: |
+          # `submodules: recursive` above should have populated contracts/lib/*.
+          # If the submodule pointers were never committed, recover by letting
+          # Foundry fetch them, so Slither/crytic-compile can build.
+          if [ ! -f lib/forge-std/src/Test.sol ] \
+            || [ ! -d lib/openzeppelin-contracts/contracts ] \
+            || [ ! -d lib/v4-core/src ] \
+            || [ ! -d lib/v4-periphery/src ] \
+            || [ ! -d lib/solady/src ] \
+            || [ ! -d lib/permit2/src ]; then
+            echo "::warning::contracts/lib incomplete — running pinned install-deps.sh."
+            bash install-deps.sh
+          fi
+          git submodule status || true
 
       - name: Run Slither on contracts/
         uses: crytic/slither-action@v0.4.0 # pin to SHA in prod
@@ -70,6 +91,9 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # GATE JOB 2/4 — Foundry fork tests against Base (forge test --fork-url ...).
+  # STRICT: a missing BASE_RPC_URL is a HARD FAILURE here. A real Base fork test
+  # MUST run before any deploy (CLAUDE.md §2). Do NOT make this lenient — that
+  # leniency lives only in ci.yml for PRs.
   # ---------------------------------------------------------------------------
   forge-fork:
     name: "Gate · Foundry fork tests (Base)"
@@ -82,12 +106,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4 # pin to SHA in prod
         with:
-          submodules: recursive
+          submodules: recursive # contracts/lib/* are git submodules (.gitmodules)
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1 # pin to SHA in prod
         with:
           version: stable
+
+      - name: Ensure contract libraries present
+        run: |
+          if [ ! -f lib/forge-std/src/Test.sol ] \
+            || [ ! -d lib/openzeppelin-contracts/contracts ] \
+            || [ ! -d lib/v4-core/src ] \
+            || [ ! -d lib/v4-periphery/src ] \
+            || [ ! -d lib/solady/src ] \
+            || [ ! -d lib/permit2/src ]; then
+            echo "::warning::contracts/lib incomplete — running pinned install-deps.sh."
+            bash install-deps.sh
+          fi
+          git submodule status || true
 
       - name: Forge build
         run: forge build --sizes
@@ -108,11 +145,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4 # pin to SHA in prod
+        with:
+          submodules: recursive # contracts/lib/* are git submodules (.gitmodules)
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1 # pin to SHA in prod
         with:
           version: stable
+
+      - name: Ensure contract libraries present
+        working-directory: contracts
+        run: |
+          if [ ! -f lib/forge-std/src/Test.sol ] \
+            || [ ! -d lib/openzeppelin-contracts/contracts ] \
+            || [ ! -d lib/v4-core/src ] \
+            || [ ! -d lib/v4-periphery/src ] \
+            || [ ! -d lib/solady/src ] \
+            || [ ! -d lib/permit2/src ]; then
+            echo "::warning::contracts/lib incomplete — running pinned install-deps.sh."
+            bash install-deps.sh
+          fi
+          git submodule status || true
 
       - name: Forge unit tests
         working-directory: contracts
@@ -159,6 +212,14 @@ jobs:
   # ---------------------------------------------------------------------------
   # BUILD — one coherent, version-locked image set for the WHOLE fleet (§3).
   # Needs ALL FOUR gate jobs: no images are built on a red gate.
+  #
+  # RESILIENT MATRIX: the full fleet is enumerated below so the release stays
+  # in-sync (§3) as each surface lands, but a component is only built if its
+  # `${component}/Dockerfile` actually exists. Missing Dockerfiles self-skip
+  # with a ::warning:: instead of failing the job. The `version` output is
+  # computed UNCONDITIONALLY on every matrix leg so downstream jobs
+  # (deploy-contracts, release-fleet) always resolve a version even while some
+  # components have no Dockerfile yet.
   # ---------------------------------------------------------------------------
   build-images:
     name: "Build · Fleet images (cosign-signed)"
@@ -171,8 +232,11 @@ jobs:
     outputs:
       version: ${{ steps.meta.outputs.version }}
     strategy:
+      fail-fast: false
       matrix:
         # One atomic release = every service/app/doc surface, same version (§3).
+        # Entries without a Dockerfile yet self-skip (guard step below); they are
+        # restored to real builds automatically the moment a Dockerfile lands.
         component:
           - services/game-backend
           - services/matchmaking
@@ -181,6 +245,7 @@ jobs:
           - services/bot-discord
           - services/bot-telegram
           - services/ai-marketing
+          - services/hookos-launch
           - apps/web-marketing
           - apps/web-dashboard
           - apps/web-marketplace
@@ -194,9 +259,21 @@ jobs:
         id: meta
         run: echo "version=${GITHUB_REF_NAME//\//-}-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
+      - name: Check for component Dockerfile
+        id: dockerfile
+        run: |
+          if [ -f "${{ matrix.component }}/Dockerfile" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::${{ matrix.component }}/Dockerfile not found — skipping image build for this component until it lands. The fleet matrix self-heals as each Dockerfile is added (CLAUDE.md §3)."
+          fi
+
       - uses: docker/setup-buildx-action@v3 # pin to SHA in prod
+        if: steps.dockerfile.outputs.exists == 'true'
 
       - name: Log in to GHCR
+        if: steps.dockerfile.outputs.exists == 'true'
         uses: docker/login-action@v3 # pin to SHA in prod
         with:
           registry: ${{ env.REGISTRY }}
@@ -204,10 +281,12 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cosign
+        if: steps.dockerfile.outputs.exists == 'true'
         uses: sigstore/cosign-installer@v3 # pin to SHA in prod
 
       - name: Build & push ${{ matrix.component }}
         id: build
+        if: steps.dockerfile.outputs.exists == 'true'
         uses: docker/build-push-action@v6 # pin to SHA in prod
         with:
           context: .
@@ -216,6 +295,7 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.component }}:${{ steps.meta.outputs.version }}
 
       - name: Sign image (keyless / OIDC)
+        if: steps.dockerfile.outputs.exists == 'true'
         run: cosign sign --yes "${REGISTRY}/${{ github.repository }}/${{ matrix.component }}@${{ steps.build.outputs.digest }}"
         env:
           REGISTRY: ${{ env.REGISTRY }}
@@ -234,12 +314,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4 # pin to SHA in prod
         with:
-          submodules: recursive
+          submodules: recursive # contracts/lib/* are git submodules (.gitmodules)
 
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1 # pin to SHA in prod
         with:
           version: stable
+
+      - name: Ensure contract libraries present
+        working-directory: contracts
+        run: |
+          if [ ! -f lib/forge-std/src/Test.sol ] \
+            || [ ! -d lib/openzeppelin-contracts/contracts ] \
+            || [ ! -d lib/v4-core/src ] \
+            || [ ! -d lib/v4-periphery/src ] \
+            || [ ! -d lib/solady/src ] \
+            || [ ! -d lib/permit2/src ]; then
+            echo "::warning::contracts/lib incomplete — running pinned install-deps.sh."
+            bash install-deps.sh
+          fi
+          git submodule status || true
 
       - name: Re-assert audit sign-off at the door (defence in depth)
         env:

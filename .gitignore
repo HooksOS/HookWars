@@ -8,8 +8,13 @@ out/
 contracts/out/
 contracts/cache/
 contracts/broadcast/
+# Pinned, reproducible deps fetched by contracts/install-deps.sh (not vendored)
+contracts/lib/
 
 # env / secrets
 .env
 .env.*
 !.env.example
+
+# TS build cache
+*.tsbuildinfo

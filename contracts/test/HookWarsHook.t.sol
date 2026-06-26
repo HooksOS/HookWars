@@ -2,18 +2,47 @@
 pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
-import {FeeMath} from "../src/HookWarsHook.sol";
+import {FeeMath, HookWarsHook} from "../src/HookWarsHook.sol";
 import {Treasury} from "../src/Treasury.sol";
 
+import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
+import {IHooks} from "v4-core/interfaces/IHooks.sol";
+import {Hooks} from "v4-core/libraries/Hooks.sol";
+import {PoolKey} from "v4-core/types/PoolKey.sol";
+import {SwapParams} from "v4-core/types/PoolOperation.sol";
+
 /// @title HookWarsHook unit tests
-/// @notice Tests the pure fee-routing arithmetic and the anti-bot guard predicate without deploying
-///         the hook itself (a live hook needs a permission-encoded CREATE2 address). The Treasury
-///         section exercises real custody/withdrawal behaviour end-to-end.
-/// @dev Fork/integration tests that attach the hook to a real PoolManager belong in a separate
+/// @notice Tests the pure fee-routing arithmetic (FeeMath), the real anti-bot guard against a
+///         deployed hook (placed at a permission-encoded address with {deployCodeTo}), the hook's
+///         declared permissions, and the Treasury custody/withdrawal flow end-to-end.
+/// @dev Full `afterSwap` fee-skim-to-treasury via `poolManager.take` requires an initialized pool
+///      with liquidity and a live PoolManager unlock context; that is covered by a separate
 ///      `*.fork.t.sol` run behind `forge test --fork-url $BASE_RPC` (see README + the deploy gate).
+///      The FeeMath suite below pins the exact arithmetic that `_afterSwap` routes.
 contract HookWarsHookTest is Test {
     // Mirror of the hook's cap so the test fails loudly if the contract constant changes.
     uint16 internal constant MAX_FEE_BPS = 1_000;
+
+    /// @dev The permission bits HookWarsHook requires encoded into its address: beforeSwap (anti-bot),
+    ///      afterSwap (fee routing), and afterSwapReturnDelta (the fee is taken via the hook delta).
+    uint160 internal constant HOOK_FLAGS =
+        uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG);
+
+    /// @notice Deploy HookWarsHook at an address whose low bits encode {HOOK_FLAGS}, satisfying
+    ///         BaseHook's constructor-time `validateHookAddress` check. The high bits are namespaced
+    ///         well above the precompile/cheatcode range.
+    function _deployHook(address poolManager, address treasury, uint16 feeBps, address owner)
+        internal
+        returns (HookWarsHook hook)
+    {
+        address hookAddr = address(uint160(uint160(0x4444) << 144) | HOOK_FLAGS);
+        deployCodeTo(
+            "HookWarsHook.sol:HookWarsHook",
+            abi.encode(IPoolManager(poolManager), treasury, feeBps, owner),
+            hookAddr
+        );
+        hook = HookWarsHook(hookAddr);
+    }
 
     // -------------------------------------------------------------------------------------------
     // Fee-routing math (real, passes with no external deps mocked)
@@ -54,22 +83,112 @@ contract HookWarsHookTest is Test {
     }
 
     // -------------------------------------------------------------------------------------------
-    // Anti-bot guard predicate (real assertion of the per-block logic)
+    // Hook permissions + anti-bot guard (real, against the deployed hook)
     // -------------------------------------------------------------------------------------------
 
-    /// @notice The guard blocks iff a caller already swapped in the current block. This asserts the
-    ///         exact predicate the hook uses (`lastSwapBlock[caller] == block.number`), so it is a
-    ///         real test of the guard rather than an empty stub.
-    function test_antiBot_blocksSameBlockOnly() public {
+    /// @notice The hook must enable exactly beforeSwap + afterSwap + afterSwapReturnDelta and nothing
+    ///         else, and must wire the PoolManager/treasury/owner it was constructed with. Deploying
+    ///         it at all proves its address encodes those permissions (BaseHook validates this in the
+    ///         constructor and reverts otherwise).
+    function test_hookPermissions_enableSwapHooksOnly() public {
+        address poolManager = makeAddr("poolManager");
+        HookWarsHook hook = _deployHook(poolManager, address(0xBEEF), 30, address(this));
+
+        assertEq(address(hook.poolManager()), poolManager, "poolManager wired");
+        assertEq(hook.treasury(), address(0xBEEF), "treasury wired");
+        assertEq(hook.feeBps(), 30, "feeBps wired");
+        assertEq(hook.owner(), address(this), "owner wired");
+        assertTrue(hook.antiBotEnabled(), "anti-bot on by default");
+
+        Hooks.Permissions memory p = hook.getHookPermissions();
+        assertTrue(p.beforeSwap, "beforeSwap enabled");
+        assertTrue(p.afterSwap, "afterSwap enabled");
+        assertTrue(p.afterSwapReturnDelta, "afterSwapReturnDelta enabled");
+        assertFalse(p.beforeSwapReturnDelta, "beforeSwapReturnDelta off");
+        assertFalse(p.beforeAddLiquidity, "addLiquidity hooks off");
+        assertFalse(p.afterAddLiquidity, "addLiquidity hooks off");
+        assertFalse(p.beforeInitialize, "initialize hooks off");
+    }
+
+    /// @notice The anti-bot guard lets a caller swap once per block: the first `beforeSwap` in a block
+    ///         succeeds and records the block, the second from the same sender reverts
+    ///         `OneSwapPerBlock`, and a later block is allowed again. Driven through the real hook's
+    ///         `onlyPoolManager` entrypoint.
+    function test_antiBot_blocksSecondSwapInSameBlock() public {
+        address poolManager = makeAddr("poolManager");
+        HookWarsHook hook = _deployHook(poolManager, address(0xBEEF), 30, address(this));
+
+        PoolKey memory key; // ignored by the guard
+        SwapParams memory params = SwapParams({zeroForOne: true, amountSpecified: -1e18, sqrtPriceLimitX96: 0});
+        address trader = makeAddr("trader");
+
         vm.roll(1_000);
-        uint256 recordedBlock = block.number; // caller "swaps" this block
 
-        // Same block as the recorded swap -> blocked.
-        assertTrue(recordedBlock == block.number, "same-block swap must be blocked");
+        // First swap of the block: succeeds, returns the IHooks selector, records the block.
+        vm.prank(poolManager);
+        (bytes4 sel,,) = hook.beforeSwap(trader, key, params, "");
+        assertEq(sel, IHooks.beforeSwap.selector, "beforeSwap selector");
+        assertEq(hook.lastSwapBlock(trader), block.number, "block recorded");
 
-        // A later block -> allowed.
-        vm.roll(block.number + 1);
-        assertFalse(recordedBlock == block.number, "next-block swap must be allowed");
+        // Second swap, same block, same sender: blocked.
+        vm.prank(poolManager);
+        vm.expectRevert(abi.encodeWithSelector(HookWarsHook.OneSwapPerBlock.selector, trader));
+        hook.beforeSwap(trader, key, params, "");
+
+        // Next block: allowed again.
+        vm.roll(1_001);
+        vm.prank(poolManager);
+        (bytes4 sel2,,) = hook.beforeSwap(trader, key, params, "");
+        assertEq(sel2, IHooks.beforeSwap.selector, "next-block swap allowed");
+        assertEq(hook.lastSwapBlock(trader), 1_001, "new block recorded");
+    }
+
+    /// @notice Disabling the guard lets a caller swap repeatedly in one block and records nothing.
+    function test_antiBot_disabledAllowsRepeatedSwaps() public {
+        address poolManager = makeAddr("poolManager");
+        HookWarsHook hook = _deployHook(poolManager, address(0xBEEF), 0, address(this));
+        hook.setAntiBotEnabled(false);
+        assertFalse(hook.antiBotEnabled(), "guard disabled");
+
+        PoolKey memory key;
+        SwapParams memory params = SwapParams({zeroForOne: false, amountSpecified: -1e18, sqrtPriceLimitX96: 0});
+        address trader = makeAddr("trader");
+        vm.roll(7);
+
+        vm.prank(poolManager);
+        hook.beforeSwap(trader, key, params, "");
+        // Same block, same sender: no revert because the guard is off.
+        vm.prank(poolManager);
+        hook.beforeSwap(trader, key, params, "");
+
+        assertEq(hook.lastSwapBlock(trader), 0, "disabled guard records nothing");
+    }
+
+    /// @notice Only the PoolManager may invoke the hook callbacks (BaseHook `onlyPoolManager`).
+    function test_beforeSwap_revertsForNonPoolManager() public {
+        address poolManager = makeAddr("poolManager");
+        HookWarsHook hook = _deployHook(poolManager, address(0xBEEF), 30, address(this));
+
+        PoolKey memory key;
+        SwapParams memory params;
+        // Caller is this test contract, not the PoolManager -> NotPoolManager().
+        vm.expectRevert();
+        hook.beforeSwap(makeAddr("trader"), key, params, "");
+    }
+
+    /// @notice Admin guards: fee cap is enforced and zero treasury is rejected.
+    function test_admin_feeCapAndZeroTreasury() public {
+        address poolManager = makeAddr("poolManager");
+        HookWarsHook hook = _deployHook(poolManager, address(0xBEEF), 30, address(this));
+
+        vm.expectRevert(abi.encodeWithSelector(HookWarsHook.FeeTooHigh.selector, MAX_FEE_BPS + 1, MAX_FEE_BPS));
+        hook.setFeeBps(MAX_FEE_BPS + 1);
+
+        hook.setFeeBps(MAX_FEE_BPS);
+        assertEq(hook.feeBps(), MAX_FEE_BPS, "fee updated to cap");
+
+        vm.expectRevert(HookWarsHook.ZeroAddress.selector);
+        hook.setTreasury(address(0));
     }
 
     // -------------------------------------------------------------------------------------------
